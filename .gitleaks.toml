@@ -1,0 +1,8 @@
+title = "Remote dictation secret scanning"
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "UserDefaults migration flag name, not a credential"
+regexTarget = "secret"
+regexes = ['''^didMigrateLatencyDefaultsV23$''']

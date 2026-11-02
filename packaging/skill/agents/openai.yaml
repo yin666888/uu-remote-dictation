@@ -1,0 +1,4 @@
+interface:
+  display_name: "UU 远控语音直输"
+  short_description: "安装与排查双 Mac 的豆包远控语音直输，支持实时文字更新、跟随豆包快捷键及独立配对"
+  default_prompt: "使用 $uu-remote-dictation 帮我安装并验证两台 Mac 的豆包远控语音直输。"

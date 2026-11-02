@@ -1,0 +1,516 @@
+import AppKit
+import QuartzCore
+import os.log
+
+final class DictationPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+enum TranscriptDraftSnapshot {
+    static func replacing(_ current: String, markedRange: NSRange, selectedRange: NSRange,
+                          replacementRange: NSRange, with incoming: String) -> String? {
+        let range = replacementRange.location != NSNotFound ? replacementRange
+            : (markedRange.location != NSNotFound ? markedRange : selectedRange)
+        guard range.location != NSNotFound, range.location <= current.utf16.count,
+              range.length <= current.utf16.count - range.location,
+              UTF16TextRange.isValid(range, in: current) else { return nil }
+        return (current as NSString).replacingCharacters(in: range, with: incoming)
+    }
+}
+
+final class ComposerTextView: NSTextView {
+    var onDraftChanged: ((String, Bool) -> Void)?
+
+    private func draft(replacing range: NSRange, with value: Any) -> String? {
+        let incoming = (value as? NSAttributedString)?.string ?? value as? String
+        guard let incoming else { return nil }
+        return TranscriptDraftSnapshot.replacing(string, markedRange: markedRange(),
+            selectedRange: selectedRange(), replacementRange: range, with: incoming)
+    }
+    override func setMarkedText(_ value: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        let snapshot = draft(replacing: replacementRange, with: value)
+        super.setMarkedText(value, selectedRange: selectedRange, replacementRange: replacementRange)
+        if let snapshot { onDraftChanged?(snapshot, true) }
+    }
+    override func insertText(_ value: Any, replacementRange: NSRange) {
+        let snapshot = draft(replacing: replacementRange, with: value)
+        super.insertText(value, replacementRange: replacementRange)
+        if let snapshot { onDraftChanged?(snapshot, false) }
+    }
+
+    var onCommit: (() -> Void)?
+    var onCancel: (() -> Void)?
+    var onControlReleased: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
+        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
+        if isReturn,
+           event.modifierFlags.intersection(disallowedModifiers).isEmpty,
+           !hasMarkedText() {
+            onCommit?()
+            return
+        }
+        if event.keyCode == 53 {
+            onCancel?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        if event.keyCode == 59, !event.modifierFlags.contains(.control) {
+            onControlReleased?()
+        }
+    }
+}
+
+enum ComposerTextLayout {
+    static func attach(_ textView: NSTextView, to scrollView: NSScrollView) {
+        textView.minSize = .zero
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = false
+        scrollView.documentView = textView
+    }
+
+    static func synchronize(_ textView: NSTextView, with scrollView: NSScrollView) {
+        scrollView.layoutSubtreeIfNeeded()
+        let contentSize = scrollView.contentSize
+        guard contentSize.width > 0, contentSize.height > 0 else { return }
+
+        var frame = textView.frame
+        frame.size.width = contentSize.width
+        frame.size.height = max(frame.height, contentSize.height)
+        textView.frame = frame
+    }
+}
+
+enum TranscriptSettlePolicy {
+    static let minimumElapsedAfterRelease: TimeInterval = 0.25
+    static let requiredStableDuration: TimeInterval = 0.20
+    static let pollingInterval: TimeInterval = 0.05
+
+    static func isReady(
+        textIsEmpty: Bool,
+        hasMarkedText: Bool,
+        elapsedAfterRelease: TimeInterval,
+        stableFor: TimeInterval
+    ) -> Bool {
+        !textIsEmpty &&
+            !hasMarkedText &&
+            elapsedAfterRelease >= minimumElapsedAfterRelease &&
+            stableFor >= requiredStableDuration
+    }
+}
+
+final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
+    var onCommit: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+    var onControlReleased: (() -> Void)?
+    var onTranscriptTimeout: (() -> Void)?
+    var onPreview: ((String) -> Void)?
+
+    private let textView = ComposerTextView()
+    private let scrollView = NSScrollView()
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let targetLabel = NSTextField(labelWithString: "")
+    private let icon = NSImageView()
+    private let spinner = NSProgressIndicator()
+    private var expandedConstraints: [NSLayoutConstraint] = []
+    private var compactConstraints: [NSLayoutConstraint] = []
+    private var isCompact = false
+    private let logger = Logger(subsystem: "org.remotedictation.bridge", category: "composer")
+    private var settleWorkItem: DispatchWorkItem?
+    private var settleStartedAt: Date?
+    private var lastTextChangeAt = Date()
+    private var sessionID = UUID()
+    private var lastLoggedLength = -1
+    private var lastLoggedMarkedState = false
+    private var isWaitingForFinalTranscript = false
+    private var acceptsTranscriptUpdates = false
+
+    init() {
+        let panel = DictationPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 570, height: 176),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "远控听写"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        super.init(window: panel)
+        buildInterface(in: panel)
+        textView.onDraftChanged = { [weak self] text, marked in
+            guard let self, self.acceptsTranscriptUpdates else { return }
+            self.lastTextChangeAt = Date()
+            let bucket = PrivacySafeTextMetrics.lengthBucket(text.utf16.count)
+            self.logger.notice("IME draft session=\(self.shortSessionID, privacy: .public) lengthBucket=\(bucket, privacy: .public) marked=\(marked, privacy: .public) finalizing=\(self.isWaitingForFinalTranscript, privacy: .public)")
+            self.onPreview?(text)
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func begin(targetDescription: String, compact: Bool = false) {
+        setCompact(compact)
+        sessionID = UUID()
+        cancelSettleTimer()
+        textView.string = ""
+        lastLoggedLength = -1
+        lastLoggedMarkedState = false
+        isWaitingForFinalTranscript = false
+        acceptsTranscriptUpdates = true
+        textView.isEditable = true
+        lastTextChangeAt = Date()
+        targetLabel.stringValue = targetDescription
+        statusLabel.stringValue = "正在启动豆包语音输入法…按住语音快捷键 说话，松开后自动发送"
+        statusLabel.textColor = .secondaryLabelColor
+        showListeningIndicator()
+
+        guard let window else { return }
+        position(window)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+        ComposerTextLayout.synchronize(textView, with: scrollView)
+        window.makeFirstResponder(textView)
+        logger.notice(
+            "Composer ready session=\(self.shortSessionID, privacy: .public) textWidth=\(self.textView.frame.width, privacy: .public) containerWidth=\(self.textView.textContainer?.containerSize.width ?? 0, privacy: .public)"
+        )
+    }
+
+    func waitForFinalTranscript() {
+        isWaitingForFinalTranscript = true
+        showProcessingIndicator("正在等待识别结果")
+        statusLabel.stringValue = "正在等待豆包语音输入法完成识别…"
+        statusLabel.textColor = .secondaryLabelColor
+        settleStartedAt = Date()
+        lastTextChangeAt = Date()
+        scheduleSettleCheck(for: sessionID)
+    }
+
+    func showSending() {
+        showProcessingIndicator("正在发送到 远端 Mac")
+        isWaitingForFinalTranscript = false
+        acceptsTranscriptUpdates = false
+        cancelSettleTimer()
+        statusLabel.stringValue = "识别完成，正在直接输入到 远端 Mac…"
+        statusLabel.textColor = .secondaryLabelColor
+        textView.isEditable = false
+        window?.makeFirstResponder(nil)
+    }
+
+    func showError(_ message: String) {
+        stopIndicatorAnimation()
+        setCompact(false)
+        icon.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "听写出错")
+        icon.contentTintColor = .systemOrange
+        icon.toolTip = message
+        NSApp.activate(ignoringOtherApps: true)
+        isWaitingForFinalTranscript = false
+        acceptsTranscriptUpdates = false
+        cancelSettleTimer()
+        statusLabel.stringValue = message
+        statusLabel.textColor = .systemRed
+        textView.isEditable = true
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(textView)
+    }
+
+    func hide() {
+        stopIndicatorAnimation()
+        isWaitingForFinalTranscript = false
+        acceptsTranscriptUpdates = false
+        cancelSettleTimer()
+        window?.orderOut(nil)
+    }
+
+    func currentText() -> String {
+        textView.string
+    }
+
+    var isReadyForLocalDictation: Bool {
+        guard let window else { return false }
+        return NSApp.isActive &&
+            window.isKeyWindow &&
+            window.firstResponder === textView &&
+            textView.frame.width > 0 &&
+            (textView.textContainer?.containerSize.width ?? 0) > 0
+    }
+
+    func textDidChange(_ notification: Notification) {
+        lastTextChangeAt = Date()
+        let length = textView.string.utf16.count
+        let marked = textView.hasMarkedText()
+        if length != lastLoggedLength || marked != lastLoggedMarkedState {
+            lastLoggedLength = length
+            lastLoggedMarkedState = marked
+            let bucket = PrivacySafeTextMetrics.lengthBucket(length)
+            logger.notice(
+                "Transcript updated session=\(self.shortSessionID, privacy: .public) lengthBucket=\(bucket, privacy: .public) marked=\(marked, privacy: .public) textWidth=\(self.textView.frame.width, privacy: .public)"
+            )
+        }
+        if length > 0, acceptsTranscriptUpdates {
+            if isWaitingForFinalTranscript {
+                statusLabel.stringValue = marked
+                    ? "豆包语音输入法正在完成识别…"
+                    : "已收到识别文字，正在准备自动发送…"
+            } else {
+                statusLabel.stringValue = marked
+                    ? "豆包语音输入法正在识别…按住语音快捷键 继续说话"
+                    : "已收到识别文字，松开语音快捷键 后自动发送"
+            }
+        }
+    }
+
+    private func buildInterface(in panel: NSPanel) {
+        guard let content = panel.contentView else { return }
+
+        icon.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "语音输入")
+        icon.contentTintColor = .systemBlue
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.wantsLayer = true
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        content.wantsLayer = true
+
+        targetLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        targetLabel.textColor = .labelColor
+        targetLabel.lineBreakMode = .byTruncatingMiddle
+        targetLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        textView.delegate = self
+        textView.font = .systemFont(ofSize: 18)
+        textView.textColor = .labelColor
+        textView.backgroundColor = .textBackgroundColor
+        textView.isRichText = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.textContainerInset = NSSize(width: 12, height: 10)
+        textView.onCommit = { [weak self] in self?.commitCurrentText() }
+        textView.onCancel = { [weak self] in self?.onCancel?() }
+        textView.onControlReleased = { [weak self] in self?.onControlReleased?() }
+
+        ComposerTextLayout.attach(textView, to: scrollView)
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = true
+        scrollView.borderType = .bezelBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        content.addSubview(icon)
+        content.addSubview(targetLabel)
+        content.addSubview(statusLabel)
+        content.addSubview(scrollView)
+        content.addSubview(spinner)
+
+        expandedConstraints = [
+            icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            icon.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
+            icon.widthAnchor.constraint(equalToConstant: 27),
+            icon.heightAnchor.constraint(equalToConstant: 27),
+
+            targetLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            targetLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            targetLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 17),
+
+            statusLabel.leadingAnchor.constraint(equalTo: targetLabel.leadingAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: targetLabel.trailingAnchor),
+            statusLabel.topAnchor.constraint(equalTo: targetLabel.bottomAnchor, constant: 2),
+
+            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            scrollView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
+            scrollView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16)
+        ]
+        compactConstraints = [
+            icon.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 40),
+            icon.heightAnchor.constraint(equalToConstant: 40),
+            // Keep the IME client at its normal usable size. Its transparent
+            // editor is clipped by the small window, rather than collapsed.
+            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scrollView.topAnchor.constraint(equalTo: content.topAnchor),
+            scrollView.widthAnchor.constraint(equalToConstant: 534),
+            scrollView.heightAnchor.constraint(equalToConstant: 100)
+        ]
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: icon.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+            spinner.widthAnchor.constraint(equalToConstant: 24),
+            spinner.heightAnchor.constraint(equalToConstant: 24)
+        ])
+        setCompact(false)
+    }
+
+    private func setCompact(_ compact: Bool) {
+        // A real local text client is still required by Doubao. Keep its editor
+        // out of the visible UI while retaining layout and IME focus.
+        isCompact = compact
+        let hideIndicator = compact && !UserDefaults.standard.bool(forKey: "showDictationIndicator")
+        icon.alphaValue = hideIndicator ? 0 : 1
+        spinner.alphaValue = hideIndicator ? 0 : 1
+        window?.hasShadow = !hideIndicator
+        window?.ignoresMouseEvents = hideIndicator
+        NSLayoutConstraint.deactivate(expandedConstraints + compactConstraints)
+        targetLabel.isHidden = compact
+        statusLabel.isHidden = compact
+        scrollView.alphaValue = compact ? 0 : 1
+        window?.contentView?.layer?.cornerRadius = compact ? 24 : 16
+        window?.contentView?.layer?.backgroundColor = compact
+            ? NSColor.clear.cgColor
+            : NSColor.windowBackgroundColor.withAlphaComponent(0.97).cgColor
+        window?.setContentSize(compact ? NSSize(width: 48, height: 48) : NSSize(width: 570, height: 176))
+        NSLayoutConstraint.activate(compact ? compactConstraints : expandedConstraints)
+        window?.contentView?.layoutSubtreeIfNeeded()
+        ComposerTextLayout.synchronize(textView, with: scrollView)
+        if let window { position(window) }
+    }
+
+    private func showListeningIndicator() {
+        stopIndicatorAnimation()
+        icon.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "正在听写")
+        icon.contentTintColor = .systemBlue
+        icon.toolTip = "正在听写 · 松开语音快捷键 发送 · Esc 取消"
+        guard isCompact, icon.alphaValue > 0, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1.0
+        pulse.toValue = 0.55
+        pulse.duration = 0.8
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        icon.layer?.add(pulse, forKey: "listeningPulse")
+    }
+
+    private func showProcessingIndicator(_ description: String) {
+        icon.layer?.removeAllAnimations()
+        icon.isHidden = isCompact
+        icon.toolTip = description
+        if isCompact {
+            spinner.setAccessibilityLabel(description)
+            spinner.startAnimation(nil)
+        }
+    }
+
+    private func stopIndicatorAnimation() {
+        icon.layer?.removeAllAnimations()
+        icon.isHidden = false
+        spinner.stopAnimation(nil)
+    }
+
+    private func position(_ window: NSWindow) {
+        let screen = NSApp.keyWindow?.screen ?? NSScreen.main
+        guard let visibleFrame = screen?.visibleFrame else {
+            window.center()
+            return
+        }
+        let frame = window.frame
+        let origin = NSPoint(
+            x: visibleFrame.midX - frame.width / 2,
+            y: visibleFrame.minY + 54
+        )
+        window.setFrameOrigin(origin)
+    }
+
+    private func commitCurrentText() {
+        let text = textView.string
+        guard !text.isEmpty else {
+            showError("没有识别到文字，请继续说话或按 Esc 取消")
+            return
+        }
+        onCommit?(text)
+    }
+
+    private func scheduleSettleCheck(for expectedSessionID: UUID) {
+        settleWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.checkWhetherTranscriptSettled(expectedSessionID: expectedSessionID)
+        }
+        settleWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + TranscriptSettlePolicy.pollingInterval,
+            execute: workItem
+        )
+    }
+
+    private func checkWhetherTranscriptSettled(expectedSessionID: UUID) {
+        guard expectedSessionID == sessionID,
+              let startedAt = settleStartedAt else { return }
+
+        let now = Date()
+        let elapsed = now.timeIntervalSince(startedAt)
+        let stableFor = now.timeIntervalSince(lastTextChangeAt)
+        let text = textView.string
+
+        if TranscriptSettlePolicy.isReady(
+            textIsEmpty: text.isEmpty,
+            hasMarkedText: textView.hasMarkedText(),
+            elapsedAfterRelease: elapsed,
+            stableFor: stableFor
+        ) {
+            let bucket = PrivacySafeTextMetrics.lengthBucket(text.utf16.count)
+            logger.notice(
+                "Transcript settled session=\(self.shortSessionID, privacy: .public) lengthBucket=\(bucket, privacy: .public) elapsed=\(elapsed, privacy: .public)"
+            )
+            onCommit?(text)
+            return
+        }
+
+        if elapsed >= 8.0 {
+            if !text.isEmpty,
+               !textView.hasMarkedText(),
+               stableFor >= TranscriptSettlePolicy.requiredStableDuration {
+                let bucket = PrivacySafeTextMetrics.lengthBucket(text.utf16.count)
+                logger.notice(
+                    "Transcript settled at deadline session=\(self.shortSessionID, privacy: .public) lengthBucket=\(bucket, privacy: .public)"
+                )
+                onCommit?(text)
+            } else {
+                let bucket = PrivacySafeTextMetrics.lengthBucket(text.utf16.count)
+                logger.error(
+                    "Transcript timeout session=\(self.shortSessionID, privacy: .public) lengthBucket=\(bucket, privacy: .public) marked=\(self.textView.hasMarkedText(), privacy: .public)"
+                )
+                onTranscriptTimeout?()
+            }
+            return
+        }
+        scheduleSettleCheck(for: expectedSessionID)
+    }
+
+    private func cancelSettleTimer() {
+        settleWorkItem?.cancel()
+        settleWorkItem = nil
+        settleStartedAt = nil
+    }
+
+    private var shortSessionID: String {
+        String(sessionID.uuidString.prefix(8))
+    }
+}

@@ -1,0 +1,14 @@
+.build/
+dist/
+.DS_Store
+.swiftpm/
+*.log
+*.jsonl
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.keychain*
+diagnostics/
+__pycache__/
